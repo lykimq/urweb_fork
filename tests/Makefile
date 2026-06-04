@@ -41,3 +41,4 @@ simple::
 	./driver.sh filter
 	./driver.sh jsbspace
 	./driver.sh utf8
+	./driver.sh opt_test

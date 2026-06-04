@@ -1012,6 +1012,97 @@ fun op o (tr2 : ('b, 'c) transform, tr1 : ('a, 'b) transform) = {
               end
 }
 
+(* oOptClean: Conditionally runs a cleanup phase (like shake or untangle).
+   It checks the size of the AST before and after the optimization phase.
+   If the optimization phase didn't change the size, it completely skips 
+   the cleanup phase to save time. *)
+fun oOptClean (trClean : ('a, 'a) transform, trOpt : ('a, 'a) transform, sizeOf : 'a -> int) = {
+    func = fn input =>
+        case #func trOpt input of
+            NONE => NONE
+          | SOME v =>
+            if sizeOf input = sizeOf v then SOME v
+            else #func trClean v,
+    print = #print trClean,
+    time = fn (input, pmap) =>
+        let
+            val sizeBefore = sizeOf input
+            val (ro, pmap) = #time trOpt (input, pmap)
+        in
+            case ro of
+                NONE => (NONE, pmap)
+              | SOME v =>
+                if sizeBefore = sizeOf v then (SOME v, pmap)
+                else #time trClean (v, pmap)
+        end
+}
+
+(* makeLoop: Runs a list of optimization phases in a loop up to maxIter times.
+   It exits the loop early if the AST size stops changing, which avoids
+   redundant passes over the syntax tree once it reaches a fixed point. *)
+fun makeLoop (phases : ('a, 'a) transform list, sizeOf : 'a -> int, maxIter : int) = {
+    func = fn input =>
+        let
+            fun loop (file, iter) =
+                let
+                    val sizeBefore = sizeOf file
+                    fun runPhases ([], file) = SOME file
+                      | runPhases (ph::phs, file) =
+                        case #func ph file of
+                            NONE => NONE
+                          | SOME file' => runPhases (phs, file')
+                in
+                    case runPhases (phases, file) of
+                        NONE => NONE
+                      | SOME file' =>
+                        if iter <= 1 orelse sizeBefore = sizeOf file' then
+                            SOME file'
+                        else
+                            loop (file', iter - 1)
+                end
+        in
+            loop (input, maxIter)
+        end,
+    print = #print (List.last phases),
+    time = fn (input, pmap) =>
+        let
+            fun loop (file, pmap, iter) =
+                let
+                    val sizeBefore = sizeOf file
+                    fun runPhases ([], file, pmap) = (SOME file, pmap)
+                      | runPhases (ph::phs, file, pmap) =
+                        case #time ph (file, pmap) of
+                            (NONE, pmap) => (NONE, pmap)
+                          | (SOME file', pmap) => runPhases (phs, file', pmap)
+                in
+                    case runPhases (phases, file, pmap) of
+                        (NONE, pmap) => (NONE, pmap)
+                      | (SOME file', pmap) =>
+                        if iter <= 1 orelse sizeBefore = sizeOf file' then
+                            (SOME file', pmap)
+                        else
+                            loop (file', pmap, iter - 1)
+                end
+        in
+            loop (input, pmap, maxIter)
+        end
+}
+
+(* Helper to calculate the size of a Core AST (counts nodes like exp, decl, etc.) *)
+val coreSize = CoreUtil.File.fold {
+    kind = fn (_, n) => n + 1,
+    con = fn (_, n) => n + 1,
+    exp = fn (_, n) => n + 1,
+    decl = fn (_, n) => n + 1
+} 0
+
+(* Helper to calculate the size of a Mono AST (counts nodes like typ, exp, decl, etc.) *)
+val monoSize = MonoUtil.File.fold {
+    typ = fn (_, n) => n + 1,
+    exp = fn (_, n) => n + 1,
+    decl = fn (_, n) => n + 1
+} 0
+
 structure SM = BinaryMapFn(struct
                            type ord_key = string
                            val compare = String.compare
@@ -1344,8 +1435,7 @@ val shake = {
 
 val toShake1 = transform shake "shake1" o toCore_untangle
 
-val toEspecialize1' = transform especialize "especialize1'" o toShake1
-val toShake1' = transform shake "shake1'" o toEspecialize1'
+val toShake1' = oOptClean (transform shake "shake1'", transform especialize "especialize1'", coreSize) o toShake1
 
 val rpcify = {
     func = Rpcify.frob,
@@ -1383,28 +1473,23 @@ val unpoly = {
     print = CorePrint.p_file CoreEnv.empty
 }
 
-val toUnpoly = transform unpoly "unpoly" o toShakey
-
 val specialize = {
     func = Specialize.specialize,
     print = CorePrint.p_file CoreEnv.empty
 }
 
-val toSpecialize = transform specialize "specialize" o toUnpoly
+(* Run a fixed-point loop for the core optimization phases.
+   Instead of a hardcoded linear chain, this loops up to 3 times and exits early
+   if the AST reaches a fixed point (size doesn't change). *)
+val toCoreLoop = makeLoop ([transform unpoly "unpoly",
+                            transform specialize "specialize",
+                            transform shake "shake4",
+                            transform especialize "especialize2",
+                            transform specialize "specialize2",
+                            transform shake "shake4'"], coreSize, 3) o toShakey
 
-val toShake4 = transform shake "shake4" o toSpecialize
-
-val toEspecialize2 = transform especialize "especialize2" o toShake4
-val toShake4' = transform shake "shake4'" o toEspecialize2
-val toUnpoly2 = transform unpoly "unpoly2" o toShake4'
-val toSpecialize2 = transform specialize "specialize2" o toUnpoly2
-val toShake4'' = transform shake "shake4'" o toSpecialize2
-val toEspecialize3 = transform especialize "especialize3" o toShake4''
-val toSpecialize3 = transform specialize "specialize3" o toEspecialize3
-
-val toReduce2 = transform reduce "reduce2" o toSpecialize3
-
-val toShake5 = transform shake "shake5" o toReduce2
+(* Skip shake5 if reduce2 didn't modify the AST *)
+val toShake5 = oOptClean (transform shake "shake5", transform reduce "reduce2", coreSize) o toCoreLoop
 
 val marshalcheck = {
     func = (fn file => (MarshalCheck.check file; file)),
@@ -1446,28 +1531,26 @@ val endpoints = {
 
 val toEndpoints = transform endpoints "endpoints" o toMonoize
 
-val toMono_opt1 = transform mono_opt "mono_opt1" o toEndpoints
-
 val untangle = {
     func = Untangle.untangle,
     print = MonoPrint.p_file MonoEnv.empty
 }
 
-val toUntangle = transform untangle "untangle" o toMono_opt1
+(* The following passes use oOptClean to skip the cleanup phases (untangle, mono_shake) 
+   if the preceding optimization phases (mono_opt, mono_reduce, fuse) didn't change the size of the IR. *)
+val toUntangle = oOptClean (transform untangle "untangle", transform mono_opt "mono_opt1", monoSize) o toEndpoints
 
 val mono_reduce = {
     func = MonoReduce.reduce,
     print = MonoPrint.p_file MonoEnv.empty
 }
 
-val toMono_reduce = transform mono_reduce "mono_reduce" o toUntangle
-
 val mono_shake = {
     func = MonoShake.shake,
     print = MonoPrint.p_file MonoEnv.empty
 }
 
-val toMono_shake = transform mono_shake "mono_shake1" o toMono_reduce
+val toMono_shake = oOptClean (transform mono_shake "mono_shake1", transform mono_reduce "mono_reduce", monoSize) o toUntangle
 
 val toMono_opt2 = transform mono_opt "mono_opt2" o toMono_shake
 
@@ -1483,9 +1566,7 @@ val namejs = {
     print = MonoPrint.p_file MonoEnv.empty
 }
 
-val toNamejs = transform namejs "namejs" o toIflow
-
-val toNamejs_untangle = transform untangle "namejs_untangle" o toNamejs
+val toNamejs_untangle = oOptClean (transform untangle "namejs_untangle", transform namejs "namejs", monoSize) o toIflow
 
 val scriptcheck = {
     func = ScriptCheck.classify,
@@ -1515,17 +1596,13 @@ val fuse = {
     print = MonoPrint.p_file MonoEnv.empty
 }
 
-val toFuse = transform fuse "fuse" o toMono_opt3
+val toUntangle2 = oOptClean (transform untangle "untangle2", transform fuse "fuse", monoSize) o toMono_opt3
 
-val toUntangle2 = transform untangle "untangle2" o toFuse
-
-val toMono_reduce2 = transform mono_reduce "mono_reduce2" o toUntangle2
-val toMono_shake2 = transform mono_shake "mono_shake2" o toMono_reduce2
+val toMono_shake2 = oOptClean (transform mono_shake "mono_shake2", transform mono_reduce "mono_reduce2", monoSize) o toUntangle2
 val toMono_opt4 = transform mono_opt "mono_opt4" o toMono_shake2
-val toMono_reduce3 = transform mono_reduce "mono_reduce3" o toMono_opt4
-val toFuse2 = transform fuse "fuse2" o toMono_reduce3
-val toUntangle3 = transform untangle "untangle3" o toFuse2
-val toMono_shake3 = transform mono_shake "mono_shake3" o toUntangle3
+
+val toFuse2_and_Untangle3 = oOptClean (transform untangle "untangle3", transform fuse "fuse2", monoSize)
+val toMono_shake3 = oOptClean (transform mono_shake "mono_shake3", toFuse2_and_Untangle3, monoSize) o transform mono_reduce "mono_reduce3" o toMono_opt4
 
 val pathcheck = {
     func = (fn file => (PathCheck.check file; file)),

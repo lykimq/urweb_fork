@@ -77,7 +77,12 @@ include/urweb/config.h
 include/urweb/config.h.in
 include/urweb/stamp-h1
 
-# python files
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+
+# IDE and build outputs
+.vscode/
+result
+bin
+
+

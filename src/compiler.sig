@@ -146,7 +146,6 @@ signature COMPILER = sig
     val toCorify : (string, Core.file) transform
     val toCore_untangle : (string, Core.file) transform
     val toShake1 : (string, Core.file) transform
-    val toEspecialize1' : (string, Core.file) transform
     val toShake1' : (string, Core.file) transform
     val toRpcify : (string, Core.file) transform
     val toCore_untangle2 : (string, Core.file) transform
@@ -157,43 +156,25 @@ signature COMPILER = sig
     val toTag : (string, Core.file) transform
     val toReduce : (string, Core.file) transform
     val toShakey : (string, Core.file) transform
-    val toUnpoly : (string, Core.file) transform
-    val toSpecialize : (string, Core.file) transform
-    val toShake4 : (string, Core.file) transform
-    val toEspecialize2 : (string, Core.file) transform
-    val toShake4' : (string, Core.file) transform
-    val toSpecialize2 : (string, Core.file) transform
-    val toUnpoly2 : (string, Core.file) transform
-    val toShake4'' : (string, Core.file) transform
-    val toEspecialize3 : (string, Core.file) transform
-    val toSpecialize3 : (string, Core.file) transform
-    val toReduce2 : (string, Core.file) transform
+    val toCoreLoop : (string, Core.file) transform
     val toShake5 : (string, Core.file) transform
     val toMarshalcheck : (string, Core.file) transform
     val toEffectize : (string, Core.file) transform
     val toCss : (string, Css.report) transform
     val toMonoize : (string, Mono.file) transform
     val toEndpoints : (string, Mono.file) transform
-    val toMono_opt1 : (string, Mono.file) transform
     val toUntangle : (string, Mono.file) transform
-    val toMono_reduce : (string, Mono.file) transform
     val toMono_shake : (string, Mono.file) transform
     val toMono_opt2 : (string, Mono.file) transform
     val toIflow : (string, Mono.file) transform
-    val toNamejs : (string, Mono.file) transform
     val toNamejs_untangle : (string, Mono.file) transform
     val toScriptcheck : (string, Mono.file) transform
     val toDbmodecheck : (string, Mono.file) transform
     val toJscomp : (string, Mono.file) transform
     val toMono_opt3 : (string, Mono.file) transform
-    val toFuse : (string, Mono.file) transform
     val toUntangle2 : (string, Mono.file) transform
-    val toMono_reduce2 : (string, Mono.file) transform
     val toMono_shake2 : (string, Mono.file) transform
     val toMono_opt4 : (string, Mono.file) transform
-    val toMono_reduce3 : (string, Mono.file) transform
-    val toFuse2 : (string, Mono.file) transform
-    val toUntangle3 : (string, Mono.file) transform
     val toMono_shake3 : (string, Mono.file) transform
     val toPathcheck : (string, Mono.file) transform
     val toSidecheck : (string, Mono.file) transform

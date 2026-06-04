@@ -11,7 +11,11 @@ TESTPID=/tmp/$1.pid
 TESTSRV=./$1.exe
 
 rm -f $TESTDB $TESTSQL $TESTPID $TESTSRV
-../bin/urweb -debug -boot -noEmacs -dbms sqlite -db $TESTDB -sql $TESTSQL "$1" || exit 1
+BOOT="-boot"
+if [ ! -d /build/urweb_fork ]; then
+    BOOT=""
+fi
+${URWEB:-../bin/urweb} $URFLAGS -debug $BOOT -noEmacs -dbms sqlite -db $TESTDB -sql $TESTSQL "$1" || exit 1
 
 if [ -e $TESTSQL ]
 then
