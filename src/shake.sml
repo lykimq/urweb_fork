@@ -36,7 +36,8 @@ open Core
 structure U = CoreUtil
 
 structure IS = IntBinarySet
-structure IM = IntBinaryMap
+(* Optimized: Use mutable IntHashTable (O(1) lookups) instead of functional IntBinaryMap (O(log n)) to avoid tree creation overhead *)
+structure IM = IntHashTable
 
 type free = {
      con : IS.set,
@@ -111,35 +112,34 @@ fun shake file =
                         (IS.add (usedE, n), usedC)
                   | (_, acc) => acc) (IS.empty, IS.empty) file
 
-        val (cdef, edef) = foldl (fn ((DCon (_, n, _, c), _), (cdef, edef)) => (IM.insert (cdef, n, [c]), edef)
-                                   | ((DDatatype dts, _), (cdef, edef)) =>
-                                     (foldl (fn ((_, n, _, xncs), cdef) =>
-                                                IM.insert (cdef, n, List.mapPartial #3 xncs)) cdef dts, edef)
-                                   | ((DVal (_, n, t, e, _), _), (cdef, edef)) => (cdef, IM.insert (edef, n, ([], t, e)))
-                                   | ((DValRec vis, _), (cdef, edef)) =>
-                                     let
-                                         val all_ns = map (fn (_, n, _, _, _) => n) vis
-                                     in
-                                         (cdef, foldl (fn ((_, n, t, e, _), edef) =>
-                                                          IM.insert (edef, n, (all_ns, t, e))) edef vis)
-                                     end
-                                   | ((DExport _, _), acc) => acc
-                                   | ((DTable (_, n, c, _, e1, c1, e2, c2), _), (cdef, edef)) =>
-                                     (cdef, IM.insert (edef, n, ([], tupleC [c, c1, c2], tupleE [e1, e2])))
-                                   | ((DSequence (_, n, _), _), (cdef, edef)) =>
-                                     (cdef, IM.insert (edef, n, ([], dummyt, dummye)))
-                                   | ((DView (_, n, _, _, c), _), (cdef, edef)) =>
-                                     (cdef, IM.insert (edef, n, ([], c, dummye)))
-                                   | ((DIndex _, _), acc) => acc
-                                   | ((DDatabase _, _), acc) => acc
-                                   | ((DCookie (_, n, c, _), _), (cdef, edef)) =>
-                                     (cdef, IM.insert (edef, n, ([], c, dummye)))
-                                   | ((DStyle (_, n, _), _), (cdef, edef)) =>
-                                     (cdef, IM.insert (edef, n, ([], dummyt, dummye)))
-                                   | ((DTask _, _), acc) => acc
-                                   | ((DPolicy _, _), acc) => acc
-                                   | ((DOnError _, _), acc) => acc)
-                                 (IM.empty, IM.empty) file
+        (* Optimized: Initialize mutable hash tables for definition environments.
+           Populating these imperatively avoids intermediate map allocation. *)
+        val cdef = IM.mkTable (256, Fail "cdef")
+        val edef = IM.mkTable (256, Fail "edef")
+
+        val () = app (fn (DCon (_, n, _, c), _) => IM.insert cdef (n, [c])
+                       | (DDatatype dts, _) =>
+                         app (fn (_, n, _, xncs) =>
+                                 IM.insert cdef (n, List.mapPartial #3 xncs)) dts
+                       | (DVal (_, n, t, e, _), _) => IM.insert edef (n, ([], t, e))
+                       | (DValRec vis, _) =>
+                         let
+                             val all_ns = map (fn (_, n, _, _, _) => n) vis
+                         in
+                             app (fn (_, n, t, e, _) =>
+                                      IM.insert edef (n, (all_ns, t, e))) vis
+                         end
+                       | (DTable (_, n, c, _, e1, c1, e2, c2), _) =>
+                         IM.insert edef (n, ([], tupleC [c, c1, c2], tupleE [e1, e2]))
+                       | (DSequence (_, n, _), _) =>
+                         IM.insert edef (n, ([], dummyt, dummye))
+                       | (DView (_, n, _, _, c), _) =>
+                         IM.insert edef (n, ([], c, dummye))
+                       | (DCookie (_, n, c, _), _) =>
+                         IM.insert edef (n, ([], c, dummye))
+                       | (DStyle (_, n, _), _) =>
+                         IM.insert edef (n, ([], dummyt, dummye))
+                       | _ => ()) file
 
         fun kind (_, s) = s
 
@@ -153,7 +153,8 @@ fun shake file =
                         val s' = {con = IS.add (#con s, n),
                                   exp = #exp s}
                     in
-                        case IM.find (cdef, n) of
+                        (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                        case IM.find cdef n of
                             NONE => s'
                           | SOME cs => foldl (fn (c, s') => shakeCon s' c) s' cs
                     end
@@ -175,7 +176,8 @@ fun shake file =
                                       con = #con s}
                         in
                             (*print ("Need " ^ Int.toString n ^ " <-- " ^ Int.toString (!current) ^ "\n");*)
-                            case IM.find (edef, n) of
+                            (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                            case IM.find edef n of
                                 NONE => s'
                               | SOME (ns, t, e) =>
                                 let
@@ -199,7 +201,8 @@ fun shake file =
         val s = {con = usedC, exp = usedE}
 
         val s = IS.foldl (fn (n, s) =>
-                             case IM.find (edef, n) of
+                             (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                             case IM.find edef n of
                                  NONE => raise Fail "Shake: Couldn't find 'val'"
                                | SOME (ns, t, e) =>
                                  let
@@ -210,7 +213,8 @@ fun shake file =
                                  end) s usedE
 
         val s = IS.foldl (fn (n, s) =>
-                             case IM.find (cdef, n) of
+                             (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                             case IM.find cdef n of
                                  NONE => raise Fail ("Shake: Couldn't find 'con' " ^ Int.toString n)
                                | SOME cs => foldl (fn (c, s) => shakeCon s c) s cs) s usedC
     in

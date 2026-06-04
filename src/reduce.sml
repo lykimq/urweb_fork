@@ -32,7 +32,8 @@ structure Reduce :> REDUCE = struct
 open Core
 
 structure IS = IntBinarySet
-structure IM = IntBinaryMap
+(* Optimized: Use mutable IntHashTable (O(1)) instead of functional IntBinaryMap (O(log n)) to speed up lookup times *)
+structure IM = IntHashTable
 
 structure E = CoreEnv
 
@@ -322,7 +323,8 @@ fun kindConAndExp (namedC, namedE) =
                 end
 
               | CNamed n =>
-                (case IM.find (namedC, n) of
+                (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                (case IM.find namedC n of
                      NONE => all
                    | SOME c => c)
 
@@ -460,7 +462,8 @@ fun kindConAndExp (namedC, namedE) =
                                 find (n, env, 0, 0, 0, 0)
                             end
                           | ENamed n =>
-                            (case IM.find (namedE, n) of
+                            (* Optimized: O(1) hash table lookup replaces O(log n) IntBinaryMap lookup *)
+                            (case IM.find namedE n of
                                  NONE => all
                                | SOME e => e)
                           | ECon (dk, pc, cs, eo) => (ECon (dk, patCon pc,
@@ -820,20 +823,23 @@ fun kindConAndExp (namedC, namedE) =
         {kind = kind, con = con, exp = exp}
     end
 
-fun kind namedC env k = #kind (kindConAndExp (namedC, IM.empty)) env k
-fun con namedC env c = #con (kindConAndExp (namedC, IM.empty)) env c
+val emptyE = IM.mkTable (0, Fail "emptyE")
+fun kind namedC env k = #kind (kindConAndExp (namedC, emptyE)) env k
+fun con namedC env c = #con (kindConAndExp (namedC, emptyE)) env c
 fun exp (namedC, namedE) env e = #exp (kindConAndExp (namedC, namedE)) env e
 
 fun reduce file =
     let
-        val uses = CoreUtil.File.fold {kind = fn (_, m) => m,
-                                       con = fn (_, m) => m,
-                                       exp = fn (e, m) =>
+        (* Optimized: Using a mutable table to track variable usages eliminates GC pressure from persistent fold updates *)
+        val uses = IM.mkTable (256, Fail "uses")
+        val () = CoreUtil.File.fold {kind = fn (_, ()) => (),
+                                       con = fn (_, ()) => (),
+                                       exp = fn (e, ()) =>
                                                 case e of
-                                                    ENamed n => IM.insert (m, n, 1 + Option.getOpt (IM.find (m, n), 0))
-                                                  | _ => m,
-                                       decl = fn (_, m) => m}
-                                      IM.empty file
+                                                    ENamed n => IM.insert uses (n, 1 + Option.getOpt (IM.find uses n, 0))
+                                                  | _ => (),
+                                       decl = fn (_, ()) => ()}
+                                      () file
 
         fun isPoly names = CoreUtil.Con.exists {kind = fn _ => false,
                                                 con = fn TCFun _ => true
@@ -854,7 +860,7 @@ fun reduce file =
                       | _ => false
             in
                 not (Settings.checkNeverInline s) andalso
-                case IM.find (uses, n) of
+                case IM.find uses n of
                     NONE => false
                   | SOME count => count <= 1
                                   orelse (case #1 e of
@@ -865,88 +871,87 @@ fun reduce file =
                                   orelse size e <= Settings.getCoreInline ()
             end
 
-        fun doDecl (d as (_, loc), st as (polyC, namedC, namedE)) =
+        (* Optimized: Store environments in mutable tables to reduce memory footprints compared to balanced trees *)
+        val namedC = IM.mkTable (256, Fail "namedC")
+        val namedE = IM.mkTable (256, Fail "namedE")
+
+        fun doDecl (d as (_, loc), polyC) =
             case #1 d of
                 DCon (x, n, k, c) =>
                 let
                     val k = kind namedC [] k
                     val c = con namedC [] c
+                    (* Imperative hash table insertion avoids reconstructing the map *)
+                    val () = IM.insert namedC (n, c)
                 in
                     ((DCon (x, n, k, c), loc),
-                     (if isPoly polyC c then
-                          IS.add (polyC, n)
-                      else
-                          polyC,
-                      IM.insert (namedC, n, c),
-                      namedE))
+                     if isPoly polyC c then
+                         IS.add (polyC, n)
+                     else
+                         polyC)
                 end
               | DDatatype dts =>
-                ((DDatatype (map (fn (x, n, ps, cs) =>
-                                     let
-                                         val env = map (fn _ => UnknownC) ps
-                                     in
-                                         (x, n, ps, map (fn (x, n, co) => (x, n, Option.map (con namedC env) co)) cs)
-                                     end) dts), loc),
-                 (if List.exists (fn (_, _, _, cs) => List.exists (fn (_, _, co) => case co of
-                                                                                        NONE => false
-                                                                                      | SOME c => isPoly polyC c) cs)
-                                 dts then
-                      foldl (fn ((_, n, _, _), polyC) => IS.add (polyC, n)) polyC dts
-                  else
-                      polyC,
-                  namedC,
-                  namedE))
+                let
+                    val dts' = map (fn (x, n, ps, cs) =>
+                                       let
+                                           val env = map (fn _ => UnknownC) ps
+                                       in
+                                           (x, n, ps, map (fn (x, n, co) => (x, n, Option.map (con namedC env) co)) cs)
+                                       end) dts
+                    val polyC' = if List.exists (fn (_, _, _, cs) => List.exists (fn (_, _, co) => case co of
+                                                                                                       NONE => false
+                                                                                                     | SOME c => isPoly polyC c) cs)
+                                                dts' then
+                                     foldl (fn ((_, n, _, _), polyC) => IS.add (polyC, n)) polyC dts'
+                                 else
+                                     polyC
+                in
+                    ((DDatatype dts', loc), polyC')
+                end
               | DVal (x, n, t, e, s) =>
                 let
                     val t = con namedC [] t
                     val e = exp (namedC, namedE) [] e
+                    val () = if mayInline (polyC, n, t, e, s) then
+                                 (* Imperative hash table insertion avoids reconstructing the map *)
+                                 IM.insert namedE (n, e)
+                             else
+                                 ()
                 in
-                    ((DVal (x, n, t, e, s), loc),
-                     (polyC,
-                      namedC,
-                      if mayInline (polyC, n, t, e, s) then
-                          IM.insert (namedE, n, e)
-                      else
-                          namedE))
+                    ((DVal (x, n, t, e, s), loc), polyC)
                 end
               | DValRec vis =>
                 ((DValRec (map (fn (x, n, t, e, s) => (x, n, con namedC [] t,
                                                        exp (namedC, namedE) [] e, s)) vis), loc),
-                 st)
-              | DExport _ => (d, st)
+                 polyC)
+              | DExport _ => (d, polyC)
               | DTable (s, n, c, s', pe, pc, ce, cc) => ((DTable (s, n, con namedC [] c, s',
                                                                   exp (namedC, namedE) [] pe,
                                                                   con namedC [] pc,
                                                                   exp (namedC, namedE) [] ce,
-                                                                  con namedC [] cc), loc), st)
-              | DSequence _ => (d, st)
-              | DView (s, n, s', e, c) => ((DView (s, n, s', exp (namedC, namedE) [] e, con namedC [] c), loc), st)
-              | DIndex (e1, e2) => ((DIndex (exp (namedC, namedE) [] e1, exp (namedC, namedE) [] e2), loc), st)
-              | DDatabase _ => (d, st)
-              | DCookie (s, n, c, s') => ((DCookie (s, n, con namedC [] c, s'), loc), st)
-              | DStyle (s, n, s') => ((DStyle (s, n, s'), loc), st)
+                                                                  con namedC [] cc), loc), polyC)
+              | DSequence _ => (d, polyC)
+              | DView (s, n, s', e, c) => ((DView (s, n, s', exp (namedC, namedE) [] e, con namedC [] c), loc), polyC)
+              | DIndex (e1, e2) => ((DIndex (exp (namedC, namedE) [] e1, exp (namedC, namedE) [] e2), loc), polyC)
+              | DDatabase _ => (d, polyC)
+              | DCookie (s, n, c, s') => ((DCookie (s, n, con namedC [] c, s'), loc), polyC)
+              | DStyle (s, n, s') => ((DStyle (s, n, s'), loc), polyC)
               | DTask (e1, e2) =>
                 let
                     val e1 = exp (namedC, namedE) [] e1
                     val e2 = exp (namedC, namedE) [] e2
                 in
-                    ((DTask (e1, e2), loc),
-                     (polyC,
-                      namedC,
-                      namedE))
+                    ((DTask (e1, e2), loc), polyC)
                 end
               | DPolicy e1 =>
                 let
                     val e1 = exp (namedC, namedE) [] e1
                 in
-                    ((DPolicy e1, loc),
-                     (polyC,
-                      namedC,
-                      namedE))
+                    ((DPolicy e1, loc), polyC)
                 end
-              | DOnError _ => (d, st)
+              | DOnError _ => (d, polyC)
 
-        val (file, _) = ListUtil.foldlMap doDecl (IS.empty, IM.empty, IM.empty) file
+        val (file, _) = ListUtil.foldlMap doDecl IS.empty file
     in
         file
     end
